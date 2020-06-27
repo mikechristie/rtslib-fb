@@ -201,6 +201,11 @@ class TPG(CFSNode):
                     raise RTSLibError("Target cannot have multiple TPGs")
 
         self._create_in_cfs_ine(mode)
+
+        # Must make before set_nexus so kernel knows we support the sesssions
+        # interface when it creates the nexus/session.
+        self._session_group = SessionGroup(self)
+
         if self.has_feature('nexus') and not self._get_nexus():
             self._set_nexus()
 
@@ -278,6 +283,7 @@ class TPG(CFSNode):
             # Nexus wwn type should match parent target
             nexus_wwn = generate_wwn(self.parent_target.wwn_type)
 
+        print "creating nexus"
         fwrite("%s/nexus" % self.path, fm.to_fabric_wwn(nexus_wwn))
 
     def _list_node_acls(self):
@@ -344,6 +350,8 @@ class TPG(CFSNode):
             lun.delete()
         for portal in self.network_portals:
             portal.delete()
+        self._session_group.delete()
+
         super(TPG, self).delete()
 
     def node_acl(self, node_wwn, mode='any'):
@@ -698,6 +706,128 @@ class LUN(CFSNode):
         return d
 
 
+class Session(CFSNode):
+    '''
+    This is an interface to a LIO Session (SCSI I_T Nexus) in configFS.
+    '''
+
+    # private stuff
+
+    def __repr__(self):
+        return "<Session %d>" % (self.sid)
+
+    def __init__(self, parent_tpg, sid, parent_nacl=None):
+        '''
+        @param parent_tpg: The parent TPG object.
+        @type parent_tpg: TPG
+        @param sid: lio/kernel session identifier
+        @param parent_nacl: The parent NodeACL object.
+        @type parent_nacl: NodeACL
+        @return: A Session object.
+        '''
+        super(Session, self).__init__()
+
+        print "made {}".format(sid)
+
+        try:
+            self._sid = int(sid)
+        except ValueError:
+            raise RTSLibError("Invalid session id")
+
+        self._parent_tpg = parent_tpg
+        self._parent_nacl = parent_nacl
+
+        if parent_nacl:
+            self._parent_path = self.parent_nacl.path
+        else:
+            self._parent_path = self.parent_tpg.path
+        self._path = "%s/sessions/session-%d" % (self._parent_path, self.sid)
+        self._create_in_cfs_ine('lookup')
+
+    def _get_sid(self):
+        return self._sid
+
+    def _get_parent_nacl(self):
+        return self._parent_nacl
+
+    def _get_parent_tpg(self):
+        return self._parent_tpg
+
+    # public stuff
+
+    def delete(self):
+        path = "%s/sessions/remove_session" % self._parent_tpg.path
+        try:
+            fwrite(path, str(self.sid))
+        except:
+            # raced with another user deleting the session
+            pass
+
+    parent_nacl = property(_get_parent_nacl,
+            doc="Get the parent NodeACL object.")
+    parent_tpg = property(_get_parent_tpg,
+            doc="Get the parent TPG object.")
+    sid = property(_get_sid,
+            doc="Get the Session's sid as an int.")
+
+
+class SessionGroup(CFSNode):
+    '''
+    A list of Sessions accessed under a ACL or dynamic sessions on a TPG.
+    '''
+
+    # private stuff
+
+    def __repr__(self):
+        return "<SessionGroup %s>" % self.sessions
+
+    def __init__(self, parent_tpg, parent_nacl=None):
+        '''
+        @param parent_tpg: The parent TPG object.
+        @type parent_tpg: TPG
+        @type parent_nacl: NodeACL
+        @return: A Session object.
+        '''
+        super(SessionGroup, self).__init__()
+
+        self._parent_tpg = parent_tpg
+        self._parent_nacl = parent_nacl
+
+        if parent_nacl:
+            self._path = "%s/sessions" % self._parent_nacl.path
+        else:
+            self._path = "%s/sessions" % self._parent_tpg.path
+ 
+        try:
+            os.mkdir(self._path, True)
+        except:
+            # Old kernel. We can run without this.
+            pass
+
+    def _list_sessions(self):
+        if not os.path.isdir(self.path):
+            return
+
+        for sess_dir in os.listdir(self.path):
+            dirname = os.path.basename(sess_dir)
+
+            if "session-" not in dirname:
+                continue
+
+            (pref, sid) = dirname.rsplit("-", 1)
+            sid = int(sid)
+            yield Session(self._parent_tpg, sid, self._parent_nacl)
+
+    # TPG public stuff
+
+    def delete(self):
+        for sess in self.sessions:
+            sess.delete()
+        super(SessionGroup, self).delete()
+
+    sessions = property(_list_sessions, doc="Get the list of Session objects.")
+
+
 class NetworkPortal(CFSNode):
     '''
     This is an interface to NetworkPortals in configFS.  A NetworkPortal is
@@ -875,6 +1005,7 @@ class NodeACL(CFSNode):
         self._node_wwn, self.wwn_type = normalize_wwn(fm.wwn_types, node_wwn)
         self._path = "%s/acls/%s" % (self.parent_tpg.path, fm.to_fabric_wwn(self.node_wwn))
         self._create_in_cfs_ine(mode)
+        self._session_group = SessionGroup(self.parent_tpg, self)
 
     def _get_node_wwn(self):
         return self._node_wwn
@@ -967,6 +1098,9 @@ class NodeACL(CFSNode):
         self._check_self()
         for mapped_lun in self.mapped_luns:
             mapped_lun.delete()
+
+        self._session_group.delete()
+
         super(NodeACL, self).delete()
 
     def mapped_lun(self, mapped_lun, tpg_lun=None, write_protect=None):
